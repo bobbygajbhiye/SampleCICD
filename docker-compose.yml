@@ -1,0 +1,57 @@
+﻿services:
+  redis:
+    image: redis:7-alpine
+    container_name: square-redis
+    ports:
+      - "6379:6379"
+
+  worker:
+    build:
+      context: ./worker
+    container_name: square-worker
+    environment:
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      REDIS_DB: 0
+    depends_on:
+      - redis
+
+  flower:
+    build:
+      context: ./worker
+    container_name: square-flower
+    command: ["celery", "-A", "tasks.celery_app", "flower", "--port=5555"]
+    environment:
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      REDIS_DB: 0
+    ports:
+      - "5555:5555"
+    depends_on:
+      - redis
+      - worker
+
+  backend:
+    build:
+      context: ./backend
+    container_name: square-backend
+    environment:
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      REDIS_DB: 0
+    ports:
+      - "8000:8000"
+    depends_on:
+      - redis
+      - worker
+
+  frontend:
+    build:
+      context: ./frontend
+    container_name: square-frontend
+    environment:
+      API_BASE_URL: http://backend:8000
+    ports:
+      - "8501:8501"
+    depends_on:
+      - backend
