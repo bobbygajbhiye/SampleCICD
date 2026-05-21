@@ -7,7 +7,7 @@ End-to-end demo architecture from your document:
 - Celery worker
 - Flower monitoring UI
 - Dockerized services
-- Jenkins pipeline scaffold
+- GitHub Actions CI/CD
 - Azure CLI deployment scripts
 
 ## Project structure
@@ -17,8 +17,8 @@ End-to-end demo architecture from your document:
 - `deploy/dev.env`: Dev environment values (non-secret)
 - `deploy/prod.env`: Prod environment values (non-secret)
 - `docker-compose.yml`: local end-to-end startup
-- `Jenkinsfile`: branch-based CI/CD (`develop` -> Dev, `main` -> Prod)
-- `scripts/azure-deploy.ps1`: Azure ACR/App Service/ACI deployment by environment
+- `.github/workflows/deploy.yml`: branch-based CI/CD (`develop` -> Dev, `main` -> Prod)
+- `scripts/azure-deploy.ps1`: Azure ACR/App Service/Redis/Container Apps deployment by environment
 
 ## Run locally (Docker)
 ```bash
@@ -36,15 +36,20 @@ Then open:
 - Update only non-secret values in:
   - `deploy/dev.env`
   - `deploy/prod.env`
-- Keep secrets in Jenkins credentials or Azure Key Vault
 
-## Jenkins credentials needed
-- `acr-creds-dev` (username/password)
-- `acr-creds-prod` (username/password)
-- `azure-sp-dev` (service principal app id/password)
-- `azure-sp-prod` (service principal app id/password)
+## GitHub Secrets needed
+- `AZURE_CREDENTIALS_DEV`: Service principal JSON for Dev
+- `AZURE_CREDENTIALS_PROD`: Service principal JSON for Prod
 
-Also define `AZURE_TENANT_ID` as a Jenkins environment variable (or inject via credentials).
+Service principal JSON format:
+```json
+{
+  "clientId": "<app-id>",
+  "clientSecret": "<password>",
+  "subscriptionId": "<subscription-id>",
+  "tenantId": "<tenant-id>"
+}
+```
 
 ## One-time infra creation
 ```powershell

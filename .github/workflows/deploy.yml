@@ -1,0 +1,166 @@
+﻿name: Build and Deploy to Azure
+
+on:
+  push:
+    branches:
+      - develop
+      - main
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set environment by branch
+        id: env
+        shell: bash
+        run: |
+          if [ "${GITHUB_REF_NAME}" = "develop" ]; then
+            echo "deploy_env=dev" >> $GITHUB_OUTPUT
+          elif [ "${GITHUB_REF_NAME}" = "main" ]; then
+            echo "deploy_env=prod" >> $GITHUB_OUTPUT
+          else
+            echo "Unsupported branch: ${GITHUB_REF_NAME}"
+            exit 1
+          fi
+
+      - name: Load env file
+        shell: bash
+        run: |
+          set -a
+          source deploy/${{ steps.env.outputs.deploy_env }}.env
+          set +a
+
+          echo "AZURE_RESOURCE_GROUP=$AZURE_RESOURCE_GROUP" >> $GITHUB_ENV
+          echo "AZURE_ACR_NAME=$AZURE_ACR_NAME" >> $GITHUB_ENV
+          echo "AZURE_BACKEND_APP=$AZURE_BACKEND_APP" >> $GITHUB_ENV
+          echo "AZURE_FRONTEND_APP=$AZURE_FRONTEND_APP" >> $GITHUB_ENV
+          echo "AZURE_LOCATION=$AZURE_LOCATION" >> $GITHUB_ENV
+          echo "AZURE_CONTAINERAPPS_ENV=$AZURE_CONTAINERAPPS_ENV" >> $GITHUB_ENV
+          echo "AZURE_CONTAINERAPPS_WORKER=$AZURE_CONTAINERAPPS_WORKER" >> $GITHUB_ENV
+          echo "AZURE_CONTAINERAPPS_FLOWER=$AZURE_CONTAINERAPPS_FLOWER" >> $GITHUB_ENV
+          echo "AZURE_CONTAINERAPPS_PROFILE=$AZURE_CONTAINERAPPS_PROFILE" >> $GITHUB_ENV
+          echo "AZURE_REDIS_NAME=$AZURE_REDIS_NAME" >> $GITHUB_ENV
+          echo "AZURE_REDIS_PORT=$AZURE_REDIS_PORT" >> $GITHUB_ENV
+          echo "AZURE_REDIS_DB=$AZURE_REDIS_DB" >> $GITHUB_ENV
+
+      - name: Azure login
+        uses: azure/login@v2
+        with:
+          creds: ${{ steps.env.outputs.deploy_env == 'dev' && secrets.AZURE_CREDENTIALS_DEV || secrets.AZURE_CREDENTIALS_PROD }}
+
+      - name: Ensure Azure CLI containerapp extension
+        shell: bash
+        run: az extension add --name containerapp --upgrade --only-show-errors
+
+      - name: Build images
+        shell: bash
+        run: |
+          TAG=${{ steps.env.outputs.deploy_env }}-${{ github.run_number }}
+          echo "IMAGE_TAG=$TAG" >> $GITHUB_ENV
+
+          docker build -t square-backend:$TAG ./backend
+          docker build -t square-frontend:$TAG ./frontend
+          docker build -t square-worker:$TAG ./worker
+
+      - name: Login to ACR
+        shell: bash
+        run: az acr login --name $AZURE_ACR_NAME
+
+      - name: Tag and push images
+        shell: bash
+        run: |
+          ACR_LOGIN_SERVER=${AZURE_ACR_NAME}.azurecr.io
+
+          docker tag square-backend:$IMAGE_TAG $ACR_LOGIN_SERVER/square-backend:$IMAGE_TAG
+          docker tag square-frontend:$IMAGE_TAG $ACR_LOGIN_SERVER/square-frontend:$IMAGE_TAG
+          docker tag square-worker:$IMAGE_TAG $ACR_LOGIN_SERVER/square-worker:$IMAGE_TAG
+
+          docker push $ACR_LOGIN_SERVER/square-backend:$IMAGE_TAG
+          docker push $ACR_LOGIN_SERVER/square-frontend:$IMAGE_TAG
+          docker push $ACR_LOGIN_SERVER/square-worker:$IMAGE_TAG
+
+      - name: Deploy backend and frontend to App Service
+        shell: bash
+        run: |
+          ACR_LOGIN_SERVER=${AZURE_ACR_NAME}.azurecr.io
+
+          az webapp config container set \
+            --name $AZURE_BACKEND_APP \
+            --resource-group $AZURE_RESOURCE_GROUP \
+            --docker-custom-image-name $ACR_LOGIN_SERVER/square-backend:$IMAGE_TAG
+
+          az webapp config container set \
+            --name $AZURE_FRONTEND_APP \
+            --resource-group $AZURE_RESOURCE_GROUP \
+            --docker-custom-image-name $ACR_LOGIN_SERVER/square-frontend:$IMAGE_TAG
+
+          az webapp restart --name $AZURE_BACKEND_APP --resource-group $AZURE_RESOURCE_GROUP
+          az webapp restart --name $AZURE_FRONTEND_APP --resource-group $AZURE_RESOURCE_GROUP
+
+      - name: Ensure Container Apps environment exists
+        shell: bash
+        run: |
+          if ! az containerapp env show --name "$AZURE_CONTAINERAPPS_ENV" --resource-group "$AZURE_RESOURCE_GROUP" >/dev/null 2>&1; then
+            az containerapp env create \
+              --name "$AZURE_CONTAINERAPPS_ENV" \
+              --resource-group "$AZURE_RESOURCE_GROUP" \
+              --location "$AZURE_LOCATION"
+          fi
+
+      - name: Deploy worker and flower to Azure Container Apps
+        shell: bash
+        run: |
+          ACR_LOGIN_SERVER="${AZURE_ACR_NAME}.azurecr.io"
+          WORKER_IMAGE="$ACR_LOGIN_SERVER/square-worker:$IMAGE_TAG"
+          FLOWER_IMAGE="$ACR_LOGIN_SERVER/square-worker:$IMAGE_TAG"
+
+          REDIS_HOST="${AZURE_REDIS_NAME}.redis.cache.windows.net"
+          REDIS_PORT="${AZURE_REDIS_PORT:-6379}"
+          REDIS_DB="${AZURE_REDIS_DB:-0}"
+
+          if az containerapp show --name "$AZURE_CONTAINERAPPS_WORKER" --resource-group "$AZURE_RESOURCE_GROUP" >/dev/null 2>&1; then
+            az containerapp update \
+              --name "$AZURE_CONTAINERAPPS_WORKER" \
+              --resource-group "$AZURE_RESOURCE_GROUP" \
+              --image "$WORKER_IMAGE" \
+              --set-env-vars REDIS_HOST="$REDIS_HOST" REDIS_PORT="${REDIS_PORT:-6379}" REDIS_DB="${REDIS_DB:-0}"
+          else
+            az containerapp create \
+              --name "$AZURE_CONTAINERAPPS_WORKER" \
+              --resource-group "$AZURE_RESOURCE_GROUP" \
+              --environment "$AZURE_CONTAINERAPPS_ENV" \
+              --image "$WORKER_IMAGE" \
+              --min-replicas 1 \
+              --max-replicas 2 \
+              --set-env-vars REDIS_HOST="$REDIS_HOST" REDIS_PORT="${REDIS_PORT:-6379}" REDIS_DB="${REDIS_DB:-0}"
+          fi
+
+          if az containerapp show --name "$AZURE_CONTAINERAPPS_FLOWER" --resource-group "$AZURE_RESOURCE_GROUP" >/dev/null 2>&1; then
+            az containerapp update \
+              --name "$AZURE_CONTAINERAPPS_FLOWER" \
+              --resource-group "$AZURE_RESOURCE_GROUP" \
+              --image "$FLOWER_IMAGE" \
+              --target-port 5555 \
+              --ingress external \
+              --set-env-vars REDIS_HOST="$REDIS_HOST" REDIS_PORT="${REDIS_PORT:-6379}" REDIS_DB="${REDIS_DB:-0}" \
+              --command celery \
+              --args -A tasks.celery_app flower --port=5555
+          else
+            az containerapp create \
+              --name "$AZURE_CONTAINERAPPS_FLOWER" \
+              --resource-group "$AZURE_RESOURCE_GROUP" \
+              --environment "$AZURE_CONTAINERAPPS_ENV" \
+              --image "$FLOWER_IMAGE" \
+              --target-port 5555 \
+              --ingress external \
+              --min-replicas 0 \
+              --max-replicas 1 \
+              --set-env-vars REDIS_HOST="$REDIS_HOST" REDIS_PORT="${REDIS_PORT:-6379}" REDIS_DB="${REDIS_DB:-0}" \
+              --command celery \
+              --args -A tasks.celery_app flower --port=5555
+          fi
