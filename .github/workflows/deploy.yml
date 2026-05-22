@@ -40,22 +40,59 @@ jobs:
           echo "AZURE_BACKEND_APP=$AZURE_BACKEND_APP" >> $GITHUB_ENV
           echo "AZURE_FRONTEND_APP=$AZURE_FRONTEND_APP" >> $GITHUB_ENV
           echo "AZURE_LOCATION=$AZURE_LOCATION" >> $GITHUB_ENV
+          echo "AZURE_APP_PLAN_LOCATION=$AZURE_APP_PLAN_LOCATION" >> $GITHUB_ENV
+          echo "AZURE_MANAGED_REDIS_NAME=$AZURE_MANAGED_REDIS_NAME" >> $GITHUB_ENV
+          echo "AZURE_MANAGED_REDIS_CLUSTERING_POLICY=$AZURE_MANAGED_REDIS_CLUSTERING_POLICY" >> $GITHUB_ENV
           echo "AZURE_CONTAINERAPPS_ENV=$AZURE_CONTAINERAPPS_ENV" >> $GITHUB_ENV
           echo "AZURE_CONTAINERAPPS_WORKER=$AZURE_CONTAINERAPPS_WORKER" >> $GITHUB_ENV
           echo "AZURE_CONTAINERAPPS_FLOWER=$AZURE_CONTAINERAPPS_FLOWER" >> $GITHUB_ENV
           echo "AZURE_CONTAINERAPPS_PROFILE=$AZURE_CONTAINERAPPS_PROFILE" >> $GITHUB_ENV
-          echo "AZURE_REDIS_NAME=$AZURE_REDIS_NAME" >> $GITHUB_ENV
-          echo "AZURE_REDIS_PORT=$AZURE_REDIS_PORT" >> $GITHUB_ENV
           echo "AZURE_REDIS_DB=$AZURE_REDIS_DB" >> $GITHUB_ENV
+          echo "AZURE_REDIS_SSL_CERT_REQS=$AZURE_REDIS_SSL_CERT_REQS" >> $GITHUB_ENV
 
       - name: Azure login
         uses: azure/login@v2
         with:
           creds: ${{ steps.env.outputs.deploy_env == 'dev' && secrets.AZURE_CREDENTIALS_DEV || secrets.AZURE_CREDENTIALS_PROD }}
 
-      - name: Ensure Azure CLI containerapp extension
+      - name: Ensure Azure CLI extensions
         shell: bash
-        run: az extension add --name containerapp --upgrade --only-show-errors
+        run: |
+          az extension add --name containerapp --upgrade --only-show-errors
+          az extension add --name redisenterprise --upgrade --only-show-errors
+
+      - name: Load Managed Redis connection
+        shell: bash
+        run: |
+          REDIS_HOST=$(az redisenterprise show \
+            --name "$AZURE_MANAGED_REDIS_NAME" \
+            --resource-group "$AZURE_RESOURCE_GROUP" \
+            --query hostName -o tsv)
+
+          REDIS_PORT=$(az redisenterprise database list \
+            --cluster-name "$AZURE_MANAGED_REDIS_NAME" \
+            --resource-group "$AZURE_RESOURCE_GROUP" \
+            --query "[0].port" -o tsv)
+
+          REDIS_CLUSTERING_POLICY=$(az redisenterprise database list \
+            --cluster-name "$AZURE_MANAGED_REDIS_NAME" \
+            --resource-group "$AZURE_RESOURCE_GROUP" \
+            --query "[0].clusteringPolicy" -o tsv)
+
+          if [ "$REDIS_CLUSTERING_POLICY" != "${AZURE_MANAGED_REDIS_CLUSTERING_POLICY:-NoCluster}" ]; then
+            echo "Managed Redis clustering policy is '$REDIS_CLUSTERING_POLICY'. Expected '${AZURE_MANAGED_REDIS_CLUSTERING_POLICY:-NoCluster}'."
+            exit 1
+          fi
+
+          REDIS_PASSWORD=$(az redisenterprise database list-keys \
+            --cluster-name "$AZURE_MANAGED_REDIS_NAME" \
+            --resource-group "$AZURE_RESOURCE_GROUP" \
+            --query primaryKey -o tsv)
+
+          echo "::add-mask::$REDIS_PASSWORD"
+          echo "AZURE_REDIS_HOST=$REDIS_HOST" >> $GITHUB_ENV
+          echo "AZURE_REDIS_PORT=$REDIS_PORT" >> $GITHUB_ENV
+          echo "AZURE_REDIS_PASSWORD=$REDIS_PASSWORD" >> $GITHUB_ENV
 
       - name: Build images
         shell: bash
@@ -99,6 +136,16 @@ jobs:
             --resource-group $AZURE_RESOURCE_GROUP \
             --docker-custom-image-name $ACR_LOGIN_SERVER/square-frontend:$IMAGE_TAG
 
+          az webapp config appsettings set \
+            --name $AZURE_BACKEND_APP \
+            --resource-group $AZURE_RESOURCE_GROUP \
+            --settings WEBSITES_PORT=8000 REDIS_HOST="$AZURE_REDIS_HOST" REDIS_PORT="${AZURE_REDIS_PORT:-6380}" REDIS_DB="${AZURE_REDIS_DB:-0}" REDIS_PASSWORD="$AZURE_REDIS_PASSWORD" REDIS_SSL=true REDIS_SSL_CERT_REQS="${AZURE_REDIS_SSL_CERT_REQS:-CERT_NONE}" CELERY_QUEUE="{celery}"
+
+          az webapp config appsettings set \
+            --name $AZURE_FRONTEND_APP \
+            --resource-group $AZURE_RESOURCE_GROUP \
+            --settings WEBSITES_PORT=8501 API_BASE_URL="https://$AZURE_BACKEND_APP.azurewebsites.net"
+
           az webapp restart --name $AZURE_BACKEND_APP --resource-group $AZURE_RESOURCE_GROUP
           az webapp restart --name $AZURE_FRONTEND_APP --resource-group $AZURE_RESOURCE_GROUP
 
@@ -119,16 +166,22 @@ jobs:
           WORKER_IMAGE="$ACR_LOGIN_SERVER/square-worker:$IMAGE_TAG"
           FLOWER_IMAGE="$ACR_LOGIN_SERVER/square-worker:$IMAGE_TAG"
 
-          REDIS_HOST="${AZURE_REDIS_NAME}.redis.cache.windows.net"
-          REDIS_PORT="${AZURE_REDIS_PORT:-6379}"
+          REDIS_HOST="${AZURE_REDIS_HOST}"
+          REDIS_PORT="${AZURE_REDIS_PORT:-6380}"
           REDIS_DB="${AZURE_REDIS_DB:-0}"
+          REDIS_SSL_CERT_REQS="${AZURE_REDIS_SSL_CERT_REQS:-CERT_NONE}"
+
+          if [ -z "$REDIS_HOST" ] || [ -z "$AZURE_REDIS_PASSWORD" ]; then
+            echo "AZURE_REDIS_HOST and AZURE_REDIS_PASSWORD must be set in deploy/${{ steps.env.outputs.deploy_env }}.env or injected before deploy."
+            exit 1
+          fi
 
           if az containerapp show --name "$AZURE_CONTAINERAPPS_WORKER" --resource-group "$AZURE_RESOURCE_GROUP" >/dev/null 2>&1; then
             az containerapp update \
               --name "$AZURE_CONTAINERAPPS_WORKER" \
               --resource-group "$AZURE_RESOURCE_GROUP" \
               --image "$WORKER_IMAGE" \
-              --set-env-vars REDIS_HOST="$REDIS_HOST" REDIS_PORT="${REDIS_PORT:-6379}" REDIS_DB="${REDIS_DB:-0}"
+              --set-env-vars REDIS_HOST="$REDIS_HOST" REDIS_PORT="$REDIS_PORT" REDIS_DB="$REDIS_DB" REDIS_PASSWORD="$AZURE_REDIS_PASSWORD" REDIS_SSL=true REDIS_SSL_CERT_REQS="$REDIS_SSL_CERT_REQS" CELERY_QUEUE="{celery}"
           else
             az containerapp create \
               --name "$AZURE_CONTAINERAPPS_WORKER" \
@@ -137,7 +190,7 @@ jobs:
               --image "$WORKER_IMAGE" \
               --min-replicas 1 \
               --max-replicas 2 \
-              --set-env-vars REDIS_HOST="$REDIS_HOST" REDIS_PORT="${REDIS_PORT:-6379}" REDIS_DB="${REDIS_DB:-0}"
+              --env-vars REDIS_HOST="$REDIS_HOST" REDIS_PORT="$REDIS_PORT" REDIS_DB="$REDIS_DB" REDIS_PASSWORD="$AZURE_REDIS_PASSWORD" REDIS_SSL=true REDIS_SSL_CERT_REQS="$REDIS_SSL_CERT_REQS" CELERY_QUEUE="{celery}"
           fi
 
           if az containerapp show --name "$AZURE_CONTAINERAPPS_FLOWER" --resource-group "$AZURE_RESOURCE_GROUP" >/dev/null 2>&1; then
@@ -145,11 +198,15 @@ jobs:
               --name "$AZURE_CONTAINERAPPS_FLOWER" \
               --resource-group "$AZURE_RESOURCE_GROUP" \
               --image "$FLOWER_IMAGE" \
-              --target-port 5555 \
-              --ingress external \
-              --set-env-vars REDIS_HOST="$REDIS_HOST" REDIS_PORT="${REDIS_PORT:-6379}" REDIS_DB="${REDIS_DB:-0}" \
+              --set-env-vars REDIS_HOST="$REDIS_HOST" REDIS_PORT="$REDIS_PORT" REDIS_DB="$REDIS_DB" REDIS_PASSWORD="$AZURE_REDIS_PASSWORD" REDIS_SSL=true REDIS_SSL_CERT_REQS="$REDIS_SSL_CERT_REQS" CELERY_QUEUE="{celery}" \
               --command celery \
-              --args -A tasks.celery_app flower --port=5555
+              --args "-A tasks.celery_app flower --port=5555"
+
+            az containerapp ingress enable \
+              --name "$AZURE_CONTAINERAPPS_FLOWER" \
+              --resource-group "$AZURE_RESOURCE_GROUP" \
+              --type external \
+              --target-port 5555
           else
             az containerapp create \
               --name "$AZURE_CONTAINERAPPS_FLOWER" \
@@ -158,9 +215,9 @@ jobs:
               --image "$FLOWER_IMAGE" \
               --target-port 5555 \
               --ingress external \
-              --min-replicas 0 \
+              --min-replicas 1 \
               --max-replicas 1 \
-              --set-env-vars REDIS_HOST="$REDIS_HOST" REDIS_PORT="${REDIS_PORT:-6379}" REDIS_DB="${REDIS_DB:-0}" \
+              --env-vars REDIS_HOST="$REDIS_HOST" REDIS_PORT="$REDIS_PORT" REDIS_DB="$REDIS_DB" REDIS_PASSWORD="$AZURE_REDIS_PASSWORD" REDIS_SSL=true REDIS_SSL_CERT_REQS="$REDIS_SSL_CERT_REQS" CELERY_QUEUE="{celery}" \
               --command celery \
-              --args -A tasks.celery_app flower --port=5555
+              --args "-A tasks.celery_app flower --port=5555"
           fi
