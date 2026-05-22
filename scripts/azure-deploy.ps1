@@ -80,6 +80,33 @@ function Wait-DnsName {
     return $false
 }
 
+function Remove-FailedContainerApp {
+    param(
+        [string]$Name,
+        [string]$ResourceGroup
+    )
+
+    $previousErrorActionPreference = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+    try {
+        $state = az containerapp show --only-show-errors --name $Name --resource-group $ResourceGroup --query "properties.provisioningState" -o tsv 2>$null
+        $exitCode = $LASTEXITCODE
+    } finally {
+        $ErrorActionPreference = $previousErrorActionPreference
+    }
+
+    if ($exitCode -ne 0) {
+        return $false
+    }
+
+    if ($state -eq "Failed") {
+        Invoke-Az "az containerapp delete --name $Name --resource-group $ResourceGroup --yes"
+        return $true
+    }
+
+    return $false
+}
+
 $envFile = Join-Path $PSScriptRoot "..\deploy\$Environment.env"
 if (-not (Test-Path $envFile)) {
     throw "Environment file not found: $envFile"
@@ -198,6 +225,18 @@ $acrExists = az acr list --resource-group $rg --query "[?name=='$acr'].name | [0
 if (-not $acrExists) {
     Invoke-Az "az acr create --resource-group $rg --name $acr --sku $acrSku"
 }
+Invoke-Az "az acr update -n $acr --admin-enabled true"
+
+if (-not $AcrUsername) {
+    $AcrUsername = az acr credential show --name $acr --resource-group $rg --query "username" -o tsv
+}
+if (-not $AcrPassword) {
+    $AcrPassword = az acr credential show --name $acr --resource-group $rg --query "passwords[0].value" -o tsv
+}
+if (-not $AcrUsername -or -not $AcrPassword) {
+    throw "Could not retrieve ACR credentials for '$acr'."
+}
+
 Invoke-Az "az acr login --name $acr"
 
 Invoke-Az "docker build -t square-backend:$imageTag ./backend"
@@ -243,14 +282,22 @@ if (-not $caEnvExists) {
 }
 
 $workerExists = az containerapp list --resource-group $rg --query "[?name=='$caWorker'].name | [0]" -o tsv
+if ($workerExists -and (Remove-FailedContainerApp -Name $caWorker -ResourceGroup $rg)) {
+    $workerExists = $null
+}
 if ($workerExists) {
+    Invoke-Az "az containerapp registry set --name $caWorker --resource-group $rg --server $acr.azurecr.io --username $AcrUsername --password $AcrPassword"
     Invoke-Az "az containerapp update --name $caWorker --resource-group $rg --image $workerImage --set-env-vars REDIS_HOST=$redisHost REDIS_PORT=$redisPort REDIS_DB=$redisDb REDIS_PASSWORD=$redisPassword REDIS_SSL=true REDIS_SSL_CERT_REQS=$redisSslCertReqs CELERY_QUEUE='{celery}'"
 } else {
     Invoke-Az "az containerapp create --name $caWorker --resource-group $rg --environment $caEnv --image $workerImage --registry-server $acr.azurecr.io --registry-username $AcrUsername --registry-password $AcrPassword --min-replicas 1 --max-replicas 2 --env-vars REDIS_HOST=$redisHost REDIS_PORT=$redisPort REDIS_DB=$redisDb REDIS_PASSWORD=$redisPassword REDIS_SSL=true REDIS_SSL_CERT_REQS=$redisSslCertReqs CELERY_QUEUE='{celery}'"
 }
 
 $flowerExists = az containerapp list --resource-group $rg --query "[?name=='$caFlower'].name | [0]" -o tsv
+if ($flowerExists -and (Remove-FailedContainerApp -Name $caFlower -ResourceGroup $rg)) {
+    $flowerExists = $null
+}
 if ($flowerExists) {
+    Invoke-Az "az containerapp registry set --name $caFlower --resource-group $rg --server $acr.azurecr.io --username $AcrUsername --password $AcrPassword"
     Invoke-Az "az containerapp update --name $caFlower --resource-group $rg --image $workerImage --command celery --args ""-A tasks.celery_app flower --port=5555"" --set-env-vars REDIS_HOST=$redisHost REDIS_PORT=$redisPort REDIS_DB=$redisDb REDIS_PASSWORD=$redisPassword REDIS_SSL=true REDIS_SSL_CERT_REQS=$redisSslCertReqs CELERY_QUEUE='{celery}'"
     Invoke-Az "az containerapp update --name $caFlower --resource-group $rg --min-replicas 1 --max-replicas 1"
     Invoke-Az "az containerapp ingress enable --name $caFlower --resource-group $rg --type external --target-port 5555"
